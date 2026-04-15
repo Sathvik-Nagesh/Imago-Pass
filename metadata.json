@@ -1,0 +1,6 @@
+{
+  "name": "DocuPhoto",
+  "description": "A passport size photo maker with automatic background removal, country templates, and high-resolution export.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}
