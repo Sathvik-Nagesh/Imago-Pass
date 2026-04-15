@@ -15,6 +15,7 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/comp
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { templates, backgroundColors } from '@/lib/templates';
 import { cn } from '@/lib/utils';
+import { calculateAutoCrop } from '@/lib/auto-crop';
 
 export default function App() {
   const [originalImage, setOriginalImage] = useState<string | null>(null);
@@ -42,6 +43,62 @@ export default function App() {
   const imgRef = useRef<HTMLImageElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const previewCanvasRef = useRef<HTMLCanvasElement>(null);
+  const workerRef = useRef<Worker | null>(null);
+
+  useEffect(() => {
+    // Initialize worker
+    workerRef.current = new Worker(new URL('./workers/bg-removal-worker.ts', import.meta.url), {
+      type: 'module'
+    });
+
+    workerRef.current.onmessage = (event) => {
+      const { type, result, error, key, current, total, isAuto } = event.data;
+
+      if (type === 'progress') {
+        const percentage = Math.round((current / total) * 100);
+        setLoadingProgress(percentage);
+        if (key.includes('fetch')) {
+          setLoadingText(`Initializing AI... ${percentage}%`);
+        } else if (key.includes('compute')) {
+          setLoadingText(`Processing... ${percentage}%`);
+        } else {
+          setLoadingText(`Finalizing... ${percentage}%`);
+        }
+      } else if (type === 'done') {
+        setLoadingProgress(100);
+        setLoadingText("Success!");
+        const bgRemovedUrl = URL.createObjectURL(result);
+        
+        // Auto-center magic only on initial upload
+        if (isAuto) {
+          handleAutoCrop(bgRemovedUrl);
+        }
+        
+        setTimeout(() => {
+          setProcessedImage(bgRemovedUrl);
+          setIsProcessing(false);
+          setLoadingProgress(0);
+        }, 500);
+      } else if (type === 'error') {
+        console.error("Worker Error:", error);
+        setIsProcessing(false);
+        setLoadingProgress(0);
+      }
+    };
+
+    return () => {
+      workerRef.current?.terminate();
+    };
+  }, []);
+
+  const handleAutoCrop = async (url: string) => {
+    const t = templates.find(t => t.id === selectedTemplate) || templates[0];
+    const autoCrop = await calculateAutoCrop(url, t.widthMm / t.heightMm);
+    if (autoCrop) {
+      setCrop(autoCrop as any);
+      setCompletedCrop(autoCrop as any);
+    }
+  };
 
   const template = templates.find(t => t.id === selectedTemplate) || templates[0];
 
@@ -93,12 +150,14 @@ export default function App() {
     if (file) {
       const reader = new FileReader();
       reader.onload = (e) => {
-        setOriginalImage(e.target?.result as string);
-        setIsCropping(true);
+        const result = e.target?.result as string;
+        setOriginalImage(result);
+        // Skip manual crop and go straight to processing
+        processImage(result);
       };
       reader.readAsDataURL(file);
     }
-  }, []);
+  }, [workerRef]);
 
   const { getRootProps, getInputProps, isDragActive } = useDropzone({
     onDrop,
@@ -111,7 +170,7 @@ export default function App() {
       // If no crop, just use original
       setCroppedImage(originalImage);
       setIsCropping(false);
-      if (originalImage) processImage(originalImage);
+      if (originalImage) processImage(originalImage, false);
       return;
     }
 
@@ -141,54 +200,28 @@ export default function App() {
     const base64Image = canvas.toDataURL('image/jpeg');
     setCroppedImage(base64Image);
     setIsCropping(false);
-    processImage(base64Image);
+    processImage(base64Image, false); // False because this is manual
   };
 
-  const processImage = async (imgSrc: string) => {
+  const processImage = async (imgSrc: string, isAuto: boolean = true) => {
+    if (!workerRef.current) return;
+    
     setIsProcessing(true);
     setLoadingProgress(0);
-    setLoadingText("Initializing local AI...");
-
-    // Temporarily suppress expected WASM threading warnings from imgly
-    const originalWarn = console.warn;
-    console.warn = (...args) => {
-      if (typeof args[0] === 'string' && (args[0].includes('env.wasm.numThreads') || args[0].includes('multi-threading is not supported'))) {
-        return;
-      }
-      originalWarn(...args);
-    };
+    setLoadingText("Offloading to Worker...");
 
     try {
       const blob = await fetch(imgSrc).then(r => r.blob());
-      const bgRemovedBlob = await removeBackground(blob, {
-        progress: (key, current, total) => {
-          const percentage = Math.round((current / total) * 100);
-          setLoadingProgress(percentage);
-          if (key.includes('fetch')) {
-            setLoadingText(`Initializing AI... ${percentage}%`);
-          } else if (key.includes('compute')) {
-            setLoadingText(`Processing Image... ${percentage}%`);
-          } else {
-            setLoadingText(`Applying Background... ${percentage}%`);
-          }
+      workerRef.current.postMessage({
+        image: blob,
+        isAuto, // Pass this to worker so it can pass it back
+        config: {
+          publicPath: '/@imgly/background-removal/dist/'
         }
       });
-      
-      setLoadingProgress(100);
-      setLoadingText("Finalizing...");
-      const bgRemovedUrl = URL.createObjectURL(bgRemovedBlob);
-      setTimeout(() => {
-        setProcessedImage(bgRemovedUrl);
-      }, 500);
     } catch (error) {
-      console.error("Error removing background:", error);
-      setProcessedImage(imgSrc);
-    } finally {
-      console.warn = originalWarn;
-      setTimeout(() => {
-        setIsProcessing(false);
-        setLoadingProgress(0);
-      }, 500);
+      console.error("Error starting worker:", error);
+      setIsProcessing(false);
     }
   };
 
@@ -582,18 +615,29 @@ export default function App() {
               </Button>
             ) : (
               <>
-                <Button 
-                  variant="outline"
-                  className="w-full border-border rounded-sm h-12"
-                  onClick={() => {
-                    setOriginalImage(null);
-                    setCroppedImage(null);
-                    setProcessedImage(null);
-                    setIsCropping(false);
-                  }}
-                >
-                  Start Over
-                </Button>
+                <div className="grid grid-cols-2 gap-2">
+                  <Button 
+                    variant="outline"
+                    className="border-border rounded-sm h-12"
+                    onClick={() => {
+                      setOriginalImage(null);
+                      setCroppedImage(null);
+                      setProcessedImage(null);
+                      setIsCropping(false);
+                    }}
+                  >
+                    Start Over
+                  </Button>
+                  <Button 
+                    variant="outline"
+                    className="border-border rounded-sm h-12 gap-2"
+                    onClick={() => setIsCropping(true)}
+                    disabled={!processedImage || isProcessing}
+                  >
+                    <CropIcon className="w-4 h-4" />
+                    Crop
+                  </Button>
+                </div>
                 <Dialog open={showDownloadConfirm} onOpenChange={setShowDownloadConfirm}>
                   <DialogTrigger render={
                     <Button 
