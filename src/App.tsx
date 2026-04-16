@@ -216,7 +216,7 @@ export default function App() {
         image: blob,
         isAuto, // Pass this to worker so it can pass it back
         config: {
-          publicPath: '/@imgly/background-removal/dist/'
+          publicPath: `${import.meta.env.BASE_URL}@imgly/background-removal/dist/`
         }
       });
     } catch (error) {
